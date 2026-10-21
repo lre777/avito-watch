@@ -143,19 +143,113 @@ def format_message(item: dict, search_name: str) -> str:
     return "\n".join(lines)
 
 
-def launch_browser(pw, headless: bool):
+def chrome_version() -> str:
+    """Версия установленного Chrome — чтобы User-Agent совпадал с реальным браузером."""
+    try:
+        import winreg
+
+        key = r"SOFTWARE\Clients\StartMenuInternet\Google\Chrome\BLBeacon"
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, key) as k:
+            v, _ = winreg.QueryValueEx(k, "version")
+        return str(v)
+    except Exception:
+        return ""
+
+
+def chrome_ua() -> str:
+    """Обычный UA. В headless Playwright подставляет 'HeadlessChrome' — это сразу палится."""
+    v = chrome_version()
+    major = v.split(".")[0] if v else "140"
+    return (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        f"(KHTML, like Gecko) Chrome/{major}.0.0.0 Safari/537.36"
+    )
+
+
+# Прячем признаки автоматизации: navigator.webdriver и пустой chrome.runtime.
+STEALTH_JS = """
+Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+Object.defineProperty(navigator, 'languages', {get: () => ['ru-RU', 'ru', 'en-US', 'en']});
+if (!window.chrome) { window.chrome = {}; }
+if (!window.chrome.runtime) { window.chrome.runtime = {}; }
+"""
+
+
+def parse_proxy(url: str) -> dict | None:
+    """'http://user:pass@host:port' -> формат, который ждёт Playwright."""
+    if not url:
+        return None
+    try:
+        p = urlparse(url)
+        if not p.hostname:
+            return None
+        out = {"server": f"{p.scheme or 'http'}://{p.hostname}:{p.port or 80}"}
+        if p.username:
+            out["username"] = p.username
+        if p.password:
+            out["password"] = p.password
+        return out
+    except Exception:
+        return None
+
+
+def launch_browser(pw, headless: bool, stealth: bool = True, proxy: str = ""):
     PROFILE.mkdir(exist_ok=True)
-    return pw.chromium.launch_persistent_context(
+    kwargs = dict(
         user_data_dir=str(PROFILE),
         channel="chrome",
         headless=headless,
         locale="ru-RU",
-        viewport={"width": 1400, "height": 900},
-        args=["--disable-blink-features=AutomationControlled"],
+        timezone_id="Asia/Yekaterinburg",
+        viewport={"width": 1920, "height": 1080},
+        args=[
+            "--disable-blink-features=AutomationControlled",
+            "--lang=ru-RU",
+            "--window-size=1920,1080",
+        ],
     )
+    if stealth:
+        kwargs["user_agent"] = chrome_ua()
+    px = parse_proxy(proxy)
+    if px:
+        kwargs["proxy"] = px
+        log(f"работаем через прокси: {px['server']}")
+    ctx = pw.chromium.launch_persistent_context(**kwargs)
+    if stealth:
+        try:
+            ctx.add_init_script(STEALTH_JS)
+        except Exception as e:
+            log(f"не удалось применить маскировку: {e}")
+    return ctx
 
 
-def fetch_items(page, url: str, limit: int) -> tuple[list[dict], str, int]:
+def human_pause(page, low: float = 0.8, high: float = 2.4) -> None:
+    """Немного «человеческого» поведения: движение мыши, прокрутка, пауза."""
+    try:
+        w = page.viewport_size or {"width": 1920, "height": 1080}
+        for _ in range(random.randint(2, 4)):
+            page.mouse.move(
+                random.randint(100, max(200, w["width"] - 100)),
+                random.randint(80, max(120, w["height"] - 150)),
+                steps=random.randint(5, 15),
+            )
+            time.sleep(random.uniform(0.05, 0.25))
+        page.mouse.wheel(0, random.randint(500, 1400))
+        time.sleep(random.uniform(0.3, 0.8))
+        page.mouse.wheel(0, -random.randint(200, 600))
+    except Exception:
+        pass
+    time.sleep(random.uniform(low, high))
+
+
+def fetch_items(page, url: str, limit: int, warmup: bool = False) -> tuple[list[dict], str, int]:
+    if warmup:
+        # Прямой заход на глубокую ссылку выглядит подозрительно — сначала заходим на главную.
+        try:
+            page.goto("https://www.avito.ru/", wait_until="domcontentloaded", timeout=45000)
+            time.sleep(random.uniform(1.2, 2.8))
+        except Exception:
+            pass
     resp = page.goto(url, wait_until="domcontentloaded", timeout=60000)
     status = resp.status if resp else 0
     try:
@@ -165,8 +259,7 @@ def fetch_items(page, url: str, limit: int) -> tuple[list[dict], str, int]:
     html = (page.inner_text("body") or "")[:5000].lower()
     if any(w in html for w in BLOCK_WORDS):
         return [], "block", status
-    page.mouse.wheel(0, 1200)
-    time.sleep(1.2)
+    human_pause(page)
     items = page.evaluate(ITEM_JS, limit)
     title = page.title()
     seen, unique = set(), []
@@ -235,9 +328,9 @@ def notify(cfg: dict, text: str) -> bool:
     return False
 
 
-def check_once(cfg: dict, page, state: dict, test: bool) -> int:
+def check_once(cfg: dict, page, state: dict, test: bool, warmup: bool = False) -> int:
     url = cfg["search_url"]
-    items, title, status = fetch_items(page, url, cfg.get("max_items_per_check", 50))
+    items, title, status = fetch_items(page, url, cfg.get("max_items_per_check", 50), warmup=warmup)
     if items == [] and status not in (200, 0):
         log(f"страница не открылась (HTTP {status})")
     if not items:
@@ -424,18 +517,22 @@ def main() -> int:
     state = load_state()
     interval = int(cfg.get("interval_seconds", 300))
     headless = bool(cfg.get("headless", False))
+    stealth = bool(cfg.get("stealth", True))
+    proxy = cfg.get("proxy") or ""
 
     with sync_playwright() as pw:
-        ctx = launch_browser(pw, headless)
+        ctx = launch_browser(pw, headless, stealth=stealth, proxy=proxy)
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
         try:
             if args.test or args.once:
-                check_once(cfg, page, state, test=args.test)
+                check_once(cfg, page, state, test=args.test, warmup=True)
                 return 0
-            log(f"слежение запущено, интервал {interval} с")
+            log(f"слежение запущено, интервал {interval} с, маскировка: {'вкл' if stealth else 'выкл'}")
+            first = True
             while True:
                 try:
-                    check_once(cfg, page, state, test=False)
+                    check_once(cfg, page, state, test=False, warmup=first)
+                    first = False
                 except Exception as e:
                     log(f"ошибка проверки: {type(e).__name__}: {e}")
                     state["fails"] = int(state.get("fails") or 0) + 1
@@ -445,7 +542,7 @@ def main() -> int:
                     # при блокировке/ошибках не долбим Авито каждые 5 минут
                     delay = min(interval * (2 ** min(fails, 4)), 1800)
                     log(f"неудачных проверок подряд: {fails} — следующая через {delay // 60} мин")
-                delay += random.randint(0, 20)
+                delay += random.randint(0, 120)
                 time.sleep(delay)
         except KeyboardInterrupt:
             log("остановлено пользователем")

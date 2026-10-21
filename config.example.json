@@ -1,7 +1,9 @@
 {
   "search_url": "",
-  "interval_seconds": 300,
+  "interval_seconds": 600,
   "headless": true,
+  "stealth": true,
+  "proxy": "",
   "max_items_per_check": 50,
   "notify_on_start": true,
   "digest_threshold": 8,
