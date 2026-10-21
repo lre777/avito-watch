@@ -7,6 +7,8 @@
     python avito_watch.py --find-tg-id  # узнать chat_id для бота Telegram
 """
 import argparse
+import base64
+import hashlib
 import json
 import random
 import re
@@ -63,6 +65,9 @@ ITEM_JS = """
 """
 
 BLOCK_WORDS = ("подтвердите, что вы не робот", "доступ ограничен", "проверка браузера")
+# Чем закончилась последняя загрузка страницы: ok / block / captcha.
+# Нужно, чтобы предупреждение в Telegram было по делу.
+last_page_kind = "ok"
 
 
 def log(msg: str) -> None:
@@ -208,6 +213,9 @@ def launch_browser(pw, headless: bool, stealth: bool = True, proxy: str = ""):
             "--window-size=1920,1080",
         ],
     )
+    if not headless:
+        # Окно есть (headful Авито любит намного больше), но живёт за пределами экрана.
+        kwargs["args"].append("--window-position=-32000,-32000")
     if stealth:
         kwargs["user_agent"] = chrome_ua()
     px = parse_proxy(proxy)
@@ -242,7 +250,102 @@ def human_pause(page, low: float = 0.8, high: float = 2.4) -> None:
     time.sleep(random.uniform(low, high))
 
 
+POW_GET = "https://www.avito.ru/web/3/firewallPow/get"
+POW_VERIFY = "https://www.avito.ru/web/3/firewallPow/verify"
+POW_HEADERS = {
+    "Accept": "application/json",
+    "Content-Type": "application/json",
+    "X-Requested-With": "XMLHttpRequest",
+    "X-Source": "client-browser",
+}
+
+
+def read_body(resp) -> str:
+    """Тело ответа без падений: у редиректов и 204 его может не быть."""
+    if resp is None:
+        return ""
+    try:
+        return resp.text() or ""
+    except Exception:
+        return ""
+
+
+def pow_challenge_from(text: str) -> str | None:
+    """Достаёт pow_challenge из JSON-ответа 439."""
+    if not text or "pow_challenge" not in text:
+        return None
+    try:
+        data = json.loads(text)
+        if isinstance(data, dict) and isinstance(data.get("pow_challenge"), str):
+            return data["pow_challenge"]
+    except Exception:
+        pass
+    m = re.search(r'"pow_challenge"\s*:\s*"([^"\\]+)"', text)
+    return m.group(1) if m else None
+
+
+def find_nonce(challenge_id: str, complexity: int) -> int:
+    """nonce, при котором SHA-256("<id>:<nonce>") начинается с complexity нулей."""
+    target = "0" * complexity
+    nonce = 0
+    while not hashlib.sha256(f"{challenge_id}:{nonce}".encode()).hexdigest().startswith(target):
+        nonce += 1
+    return nonce
+
+
+def solve_pow(page, challenge: str) -> bool:
+    """Проходит proof-of-work Авито (firewallPow): get -> nonce -> verify.
+
+    Схема из разбора трафика: сервер отдаёт 439 с pow_challenge, клиент берёт
+    JWT, подбирает nonce так, чтобы SHA-256("<id>:<nonce>") начинался с compl
+    нулей, и отправляет verify. В ответ приходит cookie v на ~7 минут.
+    """
+    req = page.context.request
+    try:
+        r = req.post(POW_GET, data=json.dumps({"challenge": challenge}),
+                     headers=POW_HEADERS, timeout=15000)
+    except Exception as e:
+        log(f"firewallPow/get: {type(e).__name__}: {e}")
+        return False
+    if r.status != 200:
+        log(f"firewallPow/get: HTTP {r.status}")
+        return False
+    data = json.loads(read_body(r) or "{}")
+    jwt = ((data.get("success") or {}).get("result") or {}).get("challenge_jwt")
+    if not jwt:
+        log("firewallPow/get: сервер не дал challenge_jwt")
+        return False
+    try:
+        part = jwt.split(".")[1]
+        payload = json.loads(base64.urlsafe_b64decode(part + "=" * (-len(part) % 4)))
+        cid, compl = payload["id"], int(payload["compl"])
+    except Exception as e:
+        log(f"firewallPow: JWT не разобрался ({type(e).__name__})")
+        return False
+
+    started = time.time()
+    nonce = find_nonce(cid, compl)
+
+    try:
+        r2 = req.post(POW_VERIFY, data=json.dumps({"challenge": jwt, "nonce": nonce}),
+                      headers=POW_HEADERS, timeout=15000)
+    except Exception as e:
+        log(f"firewallPow/verify: {type(e).__name__}: {e}")
+        return False
+    if r2.status != 200:
+        log(f"firewallPow/verify: HTTP {r2.status}")
+        return False
+    data2 = json.loads(read_body(r2) or "{}")
+    verified = bool(((data2.get("success") or {}).get("result") or {}).get("verified"))
+    log(
+        f"firewallPow: сложность {compl}, nonce {nonce} за {time.time() - started:.1f} c — "
+        f"{'пройдено' if verified else 'не пройдено'}"
+    )
+    return verified
+
+
 def fetch_items(page, url: str, limit: int, warmup: bool = False) -> tuple[list[dict], str, int]:
+    global last_page_kind
     if warmup:
         # Прямой заход на глубокую ссылку выглядит подозрительно — сначала заходим на главную.
         try:
@@ -252,13 +355,40 @@ def fetch_items(page, url: str, limit: int, warmup: bool = False) -> tuple[list[
             pass
     resp = page.goto(url, wait_until="domcontentloaded", timeout=60000)
     status = resp.status if resp else 0
+    body = read_body(resp)
+
+    # 439 — это не бан, а задание proof-of-work. Решаем и заходим заново.
+    if status == 439 or pow_challenge_from(body):
+        challenge = pow_challenge_from(body)
+        if challenge and solve_pow(page, challenge):
+            time.sleep(random.uniform(0.8, 1.8))
+            resp = page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            status = resp.status if resp else 0
+            body = read_body(resp)
+        else:
+            log("439: пройти proof-of-work не удалось")
+            return [], "block", status
+
+    # QRATOR и другие JS-проверки проходят сами в настоящем браузере — даём им время.
     try:
         page.wait_for_selector('[data-marker="item"]', timeout=15000)
     except Exception:
-        pass
+        if status in (403, 429, 439):
+            pass
+        else:
+            try:
+                page.wait_for_selector('[data-marker="item"]', timeout=12000)
+            except Exception:
+                pass
     html = (page.inner_text("body") or "")[:5000].lower()
+    if "geetest" in html or ("captcha" in html and "не робот" in html):
+        last_page_kind = "captcha"
+        log("Авито показывает капчу — нужен avito_login.py")
+        return [], "captcha", status
     if any(w in html for w in BLOCK_WORDS):
+        last_page_kind = "block"
         return [], "block", status
+    last_page_kind = "ok"
     human_pause(page)
     items = page.evaluate(ITEM_JS, limit)
     title = page.title()
@@ -339,7 +469,10 @@ def check_once(cfg: dict, page, state: dict, test: bool, warmup: bool = False) -
         # Не спамим предупреждениями: не чаще раза в час и только если они вообще доходят.
         if not test and time.time() - float(state.get("last_warn") or 0) > 3600:
             state["last_warn"] = time.time()
-            notify(cfg, "⚠️ Авито не отдал объявления. Возможно, временная блокировка — попробую позже.")
+            if last_page_kind == "captcha":
+                notify(cfg, "🔒 Авито просит капчу. Запустите на компьютере avito_login.py и пройдите проверку — дальше слежение продолжит само.")
+            else:
+                notify(cfg, "⚠️ Авито не отдал объявления. Возможно, временная блокировка — попробую позже.")
         save_state(state)
         return 0
 
