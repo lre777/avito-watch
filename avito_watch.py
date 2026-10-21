@@ -68,6 +68,8 @@ BLOCK_WORDS = ("подтвердите, что вы не робот", "дост�
 # Чем закончилась последняя загрузка страницы: ok / block / captcha.
 # Нужно, чтобы предупреждение в Telegram было по делу.
 last_page_kind = "ok"
+# HTTP-статус последней загрузки — по нему решаем, пора ли менять маршрут.
+last_http_status = 0
 
 
 def log(msg: str) -> None:
@@ -198,6 +200,32 @@ def parse_proxy(url: str) -> dict | None:
         return None
 
 
+# Ресурсы, которые не нужны для разбора объявлений: картинки, шрифты, медиа.
+# Каждая такая картинка — отдельный запрос к Авито, а лимит у них жёсткий.
+HEAVY_RESOURCES = {"image", "font", "media"}
+_request_counter = {"blocked": 0, "passed": 0}
+
+
+def _route_filter(route):
+    """Пропускает только нужное: HTML, JS, API. Картинки и шрифты — мимо."""
+    try:
+        rtype = route.request.resource_type
+    except Exception:
+        rtype = ""
+    if rtype in HEAVY_RESOURCES:
+        _request_counter["blocked"] += 1
+        try:
+            route.abort()
+        except Exception:
+            pass
+        return
+    _request_counter["passed"] += 1
+    try:
+        route.continue_()
+    except Exception:
+        pass
+
+
 def launch_browser(pw, headless: bool, stealth: bool = True, proxy: str = ""):
     PROFILE.mkdir(exist_ok=True)
     kwargs = dict(
@@ -228,6 +256,10 @@ def launch_browser(pw, headless: bool, stealth: bool = True, proxy: str = ""):
             ctx.add_init_script(STEALTH_JS)
         except Exception as e:
             log(f"не удалось применить маскировку: {e}")
+    try:
+        ctx.route("**/*", _route_filter)
+    except Exception as e:
+        log(f"фильтр запросов не включился: {e}")
     return ctx
 
 
@@ -345,7 +377,7 @@ def solve_pow(page, challenge: str) -> bool:
 
 
 def fetch_items(page, url: str, limit: int, warmup: bool = False) -> tuple[list[dict], str, int]:
-    global last_page_kind
+    global last_page_kind, last_http_status
     if warmup:
         # Прямой заход на глубокую ссылку выглядит подозрительно — сначала заходим на главную.
         try:
@@ -356,6 +388,7 @@ def fetch_items(page, url: str, limit: int, warmup: bool = False) -> tuple[list[
     resp = page.goto(url, wait_until="domcontentloaded", timeout=60000)
     status = resp.status if resp else 0
     body = read_body(resp)
+    last_http_status = status
 
     # 439 — это не бан, а задание proof-of-work. Решаем и заходим заново.
     if status == 439 or pow_challenge_from(body):
@@ -365,6 +398,7 @@ def fetch_items(page, url: str, limit: int, warmup: bool = False) -> tuple[list[
             resp = page.goto(url, wait_until="domcontentloaded", timeout=60000)
             status = resp.status if resp else 0
             body = read_body(resp)
+            last_http_status = status
         else:
             log("439: пройти proof-of-work не удалось")
             return [], "block", status
@@ -460,7 +494,12 @@ def notify(cfg: dict, text: str) -> bool:
 
 def check_once(cfg: dict, page, state: dict, test: bool, warmup: bool = False) -> int:
     url = cfg["search_url"]
+    before = dict(_request_counter)
     items, title, status = fetch_items(page, url, cfg.get("max_items_per_check", 50), warmup=warmup)
+    log(
+        f"запросов к Авито: {_request_counter['passed'] - before['passed']} нужных, "
+        f"{_request_counter['blocked'] - before['blocked']} картинок/шрифтов отсечено"
+    )
     if items == [] and status not in (200, 0):
         log(f"страница не открылась (HTTP {status})")
     if not items:
@@ -612,6 +651,26 @@ def take_lock() -> bool:
     return True
 
 
+def open_route(pw, cfg: dict, route: str):
+    """Открывает браузер по маршруту.
+
+    direct  — трафик идёт как обычно (домашний IP, если он не исключён из VPN)
+    bridge  — трафик идёт через локальный прокси-мост, а тот — через VPN
+    """
+    proxy = cfg.get("proxy") or ""
+    if route == "bridge":
+        import proxy_bridge
+
+        port = int(cfg.get("bridge_port") or 8899)
+        proxy_bridge.start(port)
+        proxy = f"http://127.0.0.1:{port}"
+    headless = bool(cfg.get("headless", False))
+    stealth = bool(cfg.get("stealth", True))
+    ctx = launch_browser(pw, headless, stealth=stealth, proxy=proxy)
+    page = ctx.pages[0] if ctx.pages else ctx.new_page()
+    return ctx, page
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--test", action="store_true", help="проверить парсинг без отправки")
@@ -620,6 +679,11 @@ def main() -> int:
     ap.add_argument("--find-tg-id", action="store_true", help="определить chat_id бота Telegram")
     ap.add_argument("--url", help="ссылка на выдачу Авито (переопределить из конфига)")
     ap.add_argument("--headless", action="store_true", help="без окна браузера")
+    ap.add_argument(
+        "--route",
+        choices=("direct", "bridge"),
+        help="маршрут: direct — как есть, bridge — через VPN-мост на 127.0.0.1",
+    )
     args = ap.parse_args()
 
     if not (args.find_max_id or args.find_tg_id) and not take_lock():
@@ -649,31 +713,52 @@ def main() -> int:
 
     state = load_state()
     interval = int(cfg.get("interval_seconds", 300))
-    headless = bool(cfg.get("headless", False))
-    stealth = bool(cfg.get("stealth", True))
-    proxy = cfg.get("proxy") or ""
+    bridge_port = int(cfg.get("bridge_port") or 0)
+    route = args.route or cfg.get("route") or "direct"
+    last_switch = 0.0
 
     with sync_playwright() as pw:
-        ctx = launch_browser(pw, headless, stealth=stealth, proxy=proxy)
-        page = ctx.pages[0] if ctx.pages else ctx.new_page()
+        ctx, page = open_route(pw, cfg, route)
         try:
             if args.test or args.once:
                 check_once(cfg, page, state, test=args.test, warmup=True)
                 return 0
-            log(f"слежение запущено, интервал {interval} с, маскировка: {'вкл' if stealth else 'выкл'}")
+            log(f"слежение запущено, интервал {interval} с, маршрут: {route}")
             first = True
             while True:
                 try:
-                    check_once(cfg, page, state, test=False, warmup=first)
-                    first = False
+                    count = check_once(cfg, page, state, test=False, warmup=first)
+                    # после неудачи следующая попытка стартует с главной — как живой человек
+                    first = not count
                 except Exception as e:
                     log(f"ошибка проверки: {type(e).__name__}: {e}")
                     state["fails"] = int(state.get("fails") or 0) + 1
+
+                # Авито заблокировал текущий адрес — уходим на другой маршрут
+                blocked = last_page_kind == "block" and last_http_status in (403, 429)
+                if bridge_port and blocked and time.time() - last_switch > 900:
+                    new_route = "bridge" if route == "direct" else "direct"
+                    log(f"адрес заблокирован (HTTP {last_http_status}) — переключаюсь на маршрут {new_route}")
+                    try:
+                        ctx.close()
+                    except Exception:
+                        pass
+                    route = new_route
+                    last_switch = time.time()
+                    try:
+                        ctx, page = open_route(pw, cfg, route)
+                    except Exception as e:
+                        log(f"браузер не открылся: {type(e).__name__}: {e}")
+                        time.sleep(120)
+                        continue
+                    first = True
+                    time.sleep(random.uniform(3, 8))
                 fails = int(state.get("fails") or 0)
                 delay = interval
                 if fails:
-                    # при блокировке/ошибках не долбим Авито каждые 5 минут
-                    delay = min(interval * (2 ** min(fails, 4)), 1800)
+                    # при блокировке/ошибках не долбим Авито: чем больше подряд отказов,
+                    # тем реже проверки (до часа — баны Авито живут примерно столько)
+                    delay = min(interval * (2 ** min(fails, 4)), 3600)
                     log(f"неудачных проверок подряд: {fails} — следующая через {delay // 60} мин")
                 delay += random.randint(0, 120)
                 time.sleep(delay)
