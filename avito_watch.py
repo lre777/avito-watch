@@ -725,7 +725,16 @@ def main() -> int:
                 return 0
             log(f"слежение запущено, интервал {interval} с, маршрут: {route}")
             first = True
+            need_open = False
             while True:
+                if need_open:
+                    try:
+                        ctx, page = open_route(pw, cfg, route)
+                        need_open = False
+                    except Exception as e:
+                        log(f"браузер не открылся: {type(e).__name__}: {e}")
+                        time.sleep(120)
+                        continue
                 try:
                     count = check_once(cfg, page, state, test=False, warmup=first)
                     # после неудачи следующая попытка стартует с главной — как живой человек
@@ -745,14 +754,11 @@ def main() -> int:
                         pass
                     route = new_route
                     last_switch = time.time()
-                    try:
-                        ctx, page = open_route(pw, cfg, route)
-                    except Exception as e:
-                        log(f"браузер не открылся: {type(e).__name__}: {e}")
-                        time.sleep(120)
-                        continue
+                    need_open = True
                     first = True
                     time.sleep(random.uniform(3, 8))
+                    # сразу пробуем новый маршрут: адреса независимы друг от друга
+                    continue
                 fails = int(state.get("fails") or 0)
                 delay = interval
                 if fails:
