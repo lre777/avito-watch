@@ -1,0 +1,13 @@
+# настройки с токеном и историей не публикуются
+config.json
+state.json
+watch.log
+
+# профиль браузера: куки Авито
+profile/
+profile_old_*/
+
+# python
+__pycache__/
+*.pyc
+.venv/

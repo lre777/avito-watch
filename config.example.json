@@ -1,0 +1,21 @@
+{
+  "search_url": "",
+  "interval_seconds": 300,
+  "headless": true,
+  "max_items_per_check": 50,
+  "notify_on_start": true,
+  "digest_threshold": 8,
+  "send_photos": true,
+  "filters": {
+    "keywords": [],
+    "exclude": [],
+    "min_price": null,
+    "max_price": null
+  },
+  "telegram": {
+    "token": "",
+    "chat_id": null,
+    "api_base": "",
+    "relay_secret": ""
+  }
+}
