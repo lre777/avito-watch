@@ -8,6 +8,7 @@
 """
 import argparse
 import json
+import random
 import re
 import socket
 import sys
@@ -240,10 +241,18 @@ def check_once(cfg: dict, page, state: dict, test: bool) -> int:
     if items == [] and status not in (200, 0):
         log(f"страница не открылась (HTTP {status})")
     if not items:
-        log("объявления не найдены (возможно, блокировка или пустая выдача)")
-        if not test:
+        state["fails"] = int(state.get("fails") or 0) + 1
+        log(f"объявления не найдены (возможно, блокировка или пустая выдача), подряд: {state['fails']}")
+        # Не спамим предупреждениями: не чаще раза в час и только если они вообще доходят.
+        if not test and time.time() - float(state.get("last_warn") or 0) > 3600:
+            state["last_warn"] = time.time()
             notify(cfg, "⚠️ Авито не отдал объявления. Возможно, временная блокировка — попробую позже.")
+        save_state(state)
         return 0
+
+    if state.get("fails"):
+        state["fails"] = 0
+        save_state(state)
 
     f = cfg.get("filters") or {}
     items = [i for i in items if passes_filters(i, f)]
@@ -429,7 +438,15 @@ def main() -> int:
                     check_once(cfg, page, state, test=False)
                 except Exception as e:
                     log(f"ошибка проверки: {type(e).__name__}: {e}")
-                time.sleep(interval)
+                    state["fails"] = int(state.get("fails") or 0) + 1
+                fails = int(state.get("fails") or 0)
+                delay = interval
+                if fails:
+                    # при блокировке/ошибках не долбим Авито каждые 5 минут
+                    delay = min(interval * (2 ** min(fails, 4)), 1800)
+                    log(f"неудачных проверок подряд: {fails} — следующая через {delay // 60} мин")
+                delay += random.randint(0, 20)
+                time.sleep(delay)
         except KeyboardInterrupt:
             log("остановлено пользователем")
         finally:
